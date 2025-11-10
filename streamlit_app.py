@@ -425,7 +425,7 @@ elif page == "Train & Evaluate":
 
                 st.markdown("#### Confusion Matrix")
                 fig, ax = plt.subplots()
-                ax.imshow(r["CM"], cmap="Blues"])
+                ax.imshow(r["CM"], cmap=["Blues"])
                 ax.set_xticks(range(len(r["Labels"]))); ax.set_yticks(range(len(r["Labels"])))
                 ax.set_xticklabels(r["Labels"], rotation=45, ha="right"); ax.set_yticklabels(r["Labels"])
                 for i in range(r["CM"].shape[0]):
