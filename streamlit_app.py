@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import altair as alt
 import streamlit as st
 
-from typing import Tuple, Dict, List, Optional, Tuple as Tup
+from typing import Tuple, Dict, List
 from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, label_binarize
@@ -94,19 +94,7 @@ def _preprocessor(num_cols, cat_cols):
         transformers=[("num", numeric, num_cols), ("cat", categorical, cat_cols)]
     )
 
-def build_soft_voter(weights: Optional[List[float]] = None) -> VotingClassifier:
-    rf = RandomForestClassifier(n_estimators=300, random_state=42)
-    gb = GradientBoostingClassifier(n_estimators=300, learning_rate=0.05, max_depth=3, random_state=42)
-    ab = AdaBoostClassifier(n_estimators=200, learning_rate=0.5, random_state=42)
-    et = ExtraTreesClassifier(n_estimators=400, random_state=42)
-    voter = VotingClassifier(
-        estimators=[("rf", rf), ("gb", gb), ("ab", ab), ("et", et)],
-        voting="soft",
-        weights=weights
-    )
-    return voter
-
-def make_pipeline(num_cols: List[str], cat_cols: List[str], model_name: str, params: Dict, voter_weights: Optional[List[float]] = None):
+def make_pipeline(num_cols: List[str], cat_cols: List[str], model_name: str, params: Dict):
     pre = _preprocessor(num_cols, cat_cols)
 
     if model_name == "Random Forest":
@@ -135,27 +123,41 @@ def make_pipeline(num_cols: List[str], cat_cols: List[str], model_name: str, par
             random_state=42
         )
     elif model_name == "Soft Voting (RF+GB+Ada+ET)":
-        clf = build_soft_voter(weights=voter_weights)
+        # Soft voting ensemble with the same base learners as single-case page
+        rf = RandomForestClassifier(n_estimators=300, random_state=42)
+        gb = GradientBoostingClassifier(n_estimators=300, learning_rate=0.05, max_depth=3, random_state=42)
+        ab = AdaBoostClassifier(n_estimators=200, learning_rate=0.5, random_state=42)
+        et = ExtraTreesClassifier(n_estimators=400, random_state=42)
+        clf = VotingClassifier(
+            estimators=[("rf", rf), ("gb", gb), ("ab", ab), ("et", et)],
+            voting="soft"
+        )
     else:
         raise ValueError("Unknown model")
 
     return Pipeline(steps=[("pre", pre), ("clf", clf)])
 
-def make_soft_voter_pipeline(num_cols: List[str], cat_cols: List[str], weights: Optional[List[float]] = None) -> Pipeline:
-    """Used on the Single-Case Prediction page; respects stored weights."""
+def make_soft_voter(num_cols: List[str], cat_cols: List[str]) -> Pipeline:
+    """Soft Voting pipeline used for Single-Case Prediction (still available there)."""
     pre = _preprocessor(num_cols, cat_cols)
-    voter = build_soft_voter(weights=weights)
+    rf = RandomForestClassifier(n_estimators=300, random_state=42)
+    gb = GradientBoostingClassifier(n_estimators=300, learning_rate=0.05, max_depth=3, random_state=42)
+    ab = AdaBoostClassifier(n_estimators=200, learning_rate=0.5, random_state=42)
+    et = ExtraTreesClassifier(n_estimators=400, random_state=42)
+    voter = VotingClassifier(
+        estimators=[("rf", rf), ("gb", gb), ("ab", ab), ("et", et)],
+        voting="soft"
+    )
     return Pipeline(steps=[("pre", pre), ("voter", voter)])
 
 def safe_roc_auc(model, X_val, y_val):
     try:
-        # route to the last step if pipeline
+        # Try to reach predict_proba on the final estimator in the pipeline
         last = model
-        if hasattr(model, "named_steps"):
-            if "clf" in model.named_steps:
-                last = model.named_steps["clf"]
-            elif "voter" in model.named_steps:
-                last = model.named_steps["voter"]
+        if hasattr(model, "named_steps") and "clf" in model.named_steps:
+            last = model.named_steps["clf"]
+        if hasattr(model, "named_steps") and "voter" in model.named_steps:
+            last = model.named_steps["voter"]
 
         if not hasattr(last, "predict_proba"):
             return np.nan
@@ -168,32 +170,13 @@ def safe_roc_auc(model, X_val, y_val):
     except Exception:
         return np.nan
 
-def soft_components_val_probs(pipe: Pipeline, X_val: pd.DataFrame) -> Optional[Tup[Dict[str, np.ndarray], np.ndarray]]:
-    """If pipe is soft voter, return dict of per-model probs on X_val (preprocessed) and classes."""
-    if not hasattr(pipe, "named_steps") or "clf" not in pipe.named_steps:
-        return None
-    voter = pipe.named_steps["clf"]
-    pre = pipe.named_steps["pre"]
-    if not isinstance(voter, VotingClassifier):
-        return None
-    # transformed features
-    Xv = pre.transform(X_val)
-    names = [name for name, _ in voter.estimators]
-    fitted = voter.estimators_  # fitted base estimators
-    probs = {}
-    for name, est in zip(names, fitted):
-        if hasattr(est, "predict_proba"):
-            probs[name] = est.predict_proba(Xv)
-    classes = voter.classes_
-    return probs, classes
-
 @st.cache_resource(show_spinner=False)
-def train_model(X, y, model_name, params, test_size, random_state, voter_weights=None):
+def train_model(X, y, model_name, params, test_size, random_state):
     X_train, X_val, y_train, y_val = train_test_split(
         X, y, test_size=test_size, random_state=random_state, stratify=y
     )
     num_cols, cat_cols = type_columns(X_train)
-    pipe = make_pipeline(num_cols, cat_cols, model_name, params, voter_weights)
+    pipe = make_pipeline(num_cols, cat_cols, model_name, params)
     pipe.fit(X_train, y_train)
     yhat = pipe.predict(X_val)
     metrics = {
@@ -329,44 +312,31 @@ elif page == "Train & Evaluate":
         with c3:
             st.caption("Hyperparameters (for selected model)")
             params = {}
-            voter_weights = None
-            show_per_model = False
-
             if model_name == "Random Forest":
                 params["n_estimators"] = st.number_input("n_estimators", min_value=50, value=300, step=50)
                 max_depth = st.text_input("max_depth (blank = None)", value="")
                 params["max_depth"] = None if max_depth.strip() == "" else int(max_depth)
-
             elif model_name == "Gradient Boosting":
                 params["n_estimators"] = st.number_input("n_estimators", min_value=50, value=300, step=50)
                 params["learning_rate"] = st.number_input("learning_rate", min_value=0.001, value=0.05, step=0.01)
                 params["max_depth"] = st.number_input("max_depth (trees)", min_value=1, value=3, step=1)
-
             elif model_name == "AdaBoost":
                 params["n_estimators"] = st.number_input("n_estimators", min_value=50, value=200, step=50)
                 params["learning_rate"] = st.number_input("learning_rate", min_value=0.01, value=0.5, step=0.01)
-
             elif model_name == "Extra Trees":
                 params["n_estimators"] = st.number_input("n_estimators", min_value=50, value=400, step=50)
                 max_depth = st.text_input("max_depth (blank = None)", value="")
                 params["max_depth"] = None if max_depth.strip() == "" else int(max_depth)
-
             elif model_name == "Soft Voting (RF+GB+Ada+ET)":
-                st.caption("Soft Voting uses RF, GB, Ada, ET with configurable weights.")
-                c_w1, c_w2, c_w3, c_w4 = st.columns(4)
-                w_rf = c_w1.number_input("RF weight", min_value=0.0, value=float(st.session_state.get("sv_w_rf", 1.0)), step=0.1)
-                w_gb = c_w2.number_input("GB weight", min_value=0.0, value=float(st.session_state.get("sv_w_gb", 1.0)), step=0.1)
-                w_ab = c_w3.number_input("Ada weight", min_value=0.0, value=float(st.session_state.get("sv_w_ab", 1.0)), step=0.1)
-                w_et = c_w4.number_input("ET weight", min_value=0.0, value=float(st.session_state.get("sv_w_et", 1.0)), step=0.1)
-                voter_weights = [w_rf, w_gb, w_ab, w_et]
-                show_per_model = st.checkbox("Show per-model validation probabilities & AUCs")
+                st.caption("Soft Voting has fixed reasonable defaults for base learners.")
+                # (You can extend to include weights etc., but keeping simple as requested.)
 
         submitted = st.form_submit_button("Train")
 
     if submitted and not train_all:
         # ---------------- Single model flow ----------------
         with st.spinner("Training..."):
-            model, metrics, cm, labels, splits = train_model(X, y, model_name, params, test_size, random_state, voter_weights=voter_weights)
+            model, metrics, cm, labels, splits = train_model(X, y, model_name, params, test_size, random_state)
 
         st.success("Training complete.")
         m1, m2, m3 = st.columns(3)
@@ -405,84 +375,26 @@ elif page == "Train & Evaluate":
             except Exception as e:
                 st.info(f"Could not render ROC curves: {e}")
 
-        # If soft voting and requested, show per-model validation probabilities & AUCs
-        if model_name == "Soft Voting (RF+GB+Ada+ET)" and show_per_model:
-            out = soft_components_val_probs(model, X_val)
-            if out is not None:
-                comp_probs, classes = out
-                # AUC per component
-                auc_rows = []
-                if len(classes) == 2:
-                    # binary
-                    for name, p in comp_probs.items():
-                        try:
-                            auc_val = roc_auc_score(y_val, p[:, 1])
-                        except Exception:
-                            auc_val = np.nan
-                        auc_rows.append({"Estimator": name, "Val ROC AUC": auc_val})
-                else:
-                    # multiclass OvR
-                    for name, p in comp_probs.items():
-                        try:
-                            auc_val = roc_auc_score(y_val, p, multi_class="ovr")
-                        except Exception:
-                            auc_val = np.nan
-                        auc_rows.append({"Estimator": name, "Val ROC AUC": auc_val})
-                st.markdown("#### Soft Voting — Per-Model Validation AUC")
-                st.dataframe(pd.DataFrame(auc_rows), use_container_width=True)
-
-                # Show first 10 rows of per-model probabilities (or class-wise means if multiclass)
-                if len(classes) == 2:
-                    show_n = min(10, len(y_val))
-                    df_list = []
-                    for name, p in comp_probs.items():
-                        df_list.append(pd.DataFrame({
-                            "estimator": name,
-                            "y_val": list(y_val)[:show_n],
-                            f"P({classes[1]})": p[:show_n, 1]
-                        }))
-                    st.markdown("#### Per-Model Validation Probabilities (first 10 rows)")
-                    st.dataframe(pd.concat(df_list, ignore_index=True), use_container_width=True)
-                else:
-                    mean_rows = []
-                    for name, p in comp_probs.items():
-                        row = {"estimator": name}
-                        for i, cls in enumerate(classes):
-                            row[f"mean_P({cls})"] = float(np.mean(p[:, i]))
-                        mean_rows.append(row)
-                    st.markdown("#### Per-Model Mean Validation Probabilities (multiclass)")
-                    st.dataframe(pd.DataFrame(mean_rows), use_container_width=True)
-            else:
-                st.info("Per-model probabilities unavailable (not a soft voting pipeline).")
-
-        # Save (and remember voter weights if any)
+        # Save for single-case page (we’ll still build soft-voter there if needed)
         st.session_state["trained_model"] = model
         st.session_state["feature_columns"] = list(X.columns)
         st.session_state["train_df"] = pd.concat([X, y.rename(label_col)], axis=1)
-        st.session_state["label_col"] = label_col
-        if voter_weights is not None:
-            st.session_state["sv_w_rf"], st.session_state["sv_w_gb"], st.session_state["sv_w_ab"], st.session_state["sv_w_et"] = voter_weights
+        st.session_state["label_col"] = label_col  # remember the target
 
     if submitted and train_all:
         # ---------------- Train ALL models and compare (including Soft Voting) ----------------
         with st.spinner("Training all models..."):
-            default_weights = [
-                float(st.session_state.get("sv_w_rf", 1.0)),
-                float(st.session_state.get("sv_w_gb", 1.0)),
-                float(st.session_state.get("sv_w_ab", 1.0)),
-                float(st.session_state.get("sv_w_et", 1.0)),
-            ]
             all_cfgs = [
-                ("Random Forest", {"n_estimators": 300, "max_depth": None}, None),
-                ("Gradient Boosting", {"n_estimators": 300, "learning_rate": 0.05, "max_depth": 3}, None),
-                ("AdaBoost", {"n_estimators": 200, "learning_rate": 0.5}, None),
-                ("Extra Trees", {"n_estimators": 400, "max_depth": None}, None),
-                ("Soft Voting (RF+GB+Ada+ET)", {}, default_weights),
+                ("Random Forest", {"n_estimators": 300, "max_depth": None}),
+                ("Gradient Boosting", {"n_estimators": 300, "learning_rate": 0.05, "max_depth": 3}),
+                ("AdaBoost", {"n_estimators": 200, "learning_rate": 0.5}),
+                ("Extra Trees", {"n_estimators": 400, "max_depth": None}),
+                ("Soft Voting (RF+GB+Ada+ET)", {}),  # uses defaults in make_pipeline
             ]
 
             results = []
-            for name, p, w in all_cfgs:
-                mdl, mtr, cm, lbls, splits = train_model(X, y, name, p, test_size, random_state, voter_weights=w)
+            for name, p in all_cfgs:
+                mdl, mtr, cm, lbls, splits = train_model(X, y, name, p, test_size, random_state)
                 results.append({
                     "Model": name,
                     "Accuracy": mtr["accuracy"],
@@ -513,7 +425,7 @@ elif page == "Train & Evaluate":
 
                 st.markdown("#### Confusion Matrix")
                 fig, ax = plt.subplots()
-                ax.imshow(r["CM"], cmap="Blues")
+                ax.imshow(r["CM"], cmap=["Blues"])
                 ax.set_xticks(range(len(r["Labels"]))); ax.set_yticks(range(len(r["Labels"])))
                 ax.set_xticklabels(r["Labels"], rotation=45, ha="right"); ax.set_yticklabels(r["Labels"])
                 for i in range(r["CM"].shape[0]):
@@ -540,7 +452,7 @@ elif page == "Train & Evaluate":
                     except Exception as e:
                         st.info(f"Could not render ROC curves: {e}")
 
-        # Keep best by accuracy for convenience
+        # Keep best by accuracy for convenience (single-case can still use soft voter)
         best_row = max(results, key=lambda r: r["Accuracy"])
         st.session_state["trained_model"] = best_row["Estimator"]
         st.session_state["feature_columns"] = list(X.columns)
@@ -557,28 +469,20 @@ elif page == "Single-Case Prediction":
         train_df_full = st.session_state["train_df"].copy()
         tgt_col = st.session_state["label_col"]
 
-        # Pull last-used soft-voter weights (defaults 1.0)
-        sv_w_rf = float(st.session_state.get("sv_w_rf", 1.0))
-        sv_w_gb = float(st.session_state.get("sv_w_gb", 1.0))
-        sv_w_ab = float(st.session_state.get("sv_w_ab", 1.0))
-        sv_w_et = float(st.session_state.get("sv_w_et", 1.0))
-
+        # Build inputs UI (INLINE WHOLE-NUMBER RANGE TEXT; AGE = WHOLE NUMBERS)
         with st.form("single_case"):
-            st.subheader("Enter values (Soft Voting across RF/GB/Ada/ExtraTrees)")
-            c_w1, c_w2, c_w3, c_w4 = st.columns(4)
-            sv_w_rf = c_w1.number_input("RF weight", min_value=0.0, value=sv_w_rf, step=0.1)
-            sv_w_gb = c_w2.number_input("GB weight", min_value=0.0, value=sv_w_gb, step=0.1)
-            sv_w_ab = c_w3.number_input("Ada weight", min_value=0.0, value=sv_w_ab, step=0.1)
-            sv_w_et = c_w4.number_input("ET weight", min_value=0.0, value=sv_w_et, step=0.1)
-
+            st.subheader("Enter values (prediction uses Soft Voting across RF/GB/Ada/ExtraTrees)")
             values = {}
             for c in feat_cols:
                 series = train_df_full[c]
+
+                # -------- Categorical ----------
                 if series.dtype == "object" or str(series.dtype) == "category" or series.dtype == "bool":
                     opts = sorted([o for o in series.dropna().unique().tolist()])
                     values[c] = st.selectbox(c, options=opts if len(opts) > 0 else [""], key=f"{c}_sb")
                     continue
 
+                # -------- Numeric ----------
                 s = pd.to_numeric(series, errors="coerce").dropna()
                 if len(s) == 0:
                     st.markdown(f"**{c}**")
@@ -586,9 +490,11 @@ elif page == "Single-Case Prediction":
                     continue
 
                 mn, mx = float(s.min()), float(s.max())
+                # For the inline text, show WHOLE numbers
                 mn_i, mx_i = int(np.floor(mn)), int(np.ceil(mx))
 
                 if c.strip().lower() == "age":
+                    # Age as whole numbers with integer bounds
                     default_i = int(np.clip(int(round(float(s.mean()))), mn_i, mx_i))
                     st.markdown(
                         f"**{c}** <span style='color:gray'>(Allowed: [{mn_i}, {mx_i}])</span>",
@@ -603,6 +509,7 @@ elif page == "Single-Case Prediction":
                         key=f"{c}_int",
                     )
                 else:
+                    # Other numerics: show whole-number range text, allow float inputs
                     default_f = float(np.clip(float(s.mean()), mn, mx))
                     step = (mx - mn) / 100.0 if mx > mn else 0.01
                     st.markdown(
@@ -617,15 +524,18 @@ elif page == "Single-Case Prediction":
                         step=float(step),
                         key=f"{c}_float",
                     )
+
             predict_btn = st.form_submit_button("Predict")
 
         if predict_btn:
+            # Train soft voter on ALL available training data saved earlier
             X_all = train_df_full[feat_cols]
             y_all = train_df_full[tgt_col]
             num_cols, cat_cols = type_columns(X_all)
-            soft_voter = make_soft_voter_pipeline(num_cols, cat_cols, weights=[sv_w_rf, sv_w_gb, sv_w_ab, sv_w_et])
+            soft_voter = make_soft_voter(num_cols, cat_cols)
             soft_voter.fit(X_all, y_all)
 
+            # Predict for the single row
             x_row = pd.DataFrame([values])[feat_cols]
             pred = soft_voter.predict(x_row)[0]
             st.markdown(
@@ -643,7 +553,7 @@ elif page == "Single-Case Prediction":
             )
             if hasattr(soft_voter, "predict_proba"):
                 proba = soft_voter.predict_proba(x_row).flatten()
-                prob_df = pd.DataFrame({"class": list(soft_voter.named_steps["voter"].classes_), "probability": proba})
+                prob_df = pd.DataFrame({"class": list(soft_voter.classes_), "probability": proba})
                 prob_df["probability"] = prob_df["probability"].round(4)
                 st.markdown("#### Class Probabilities (Soft Voting)")
                 chart = (
@@ -658,6 +568,5 @@ elif page == "Single-Case Prediction":
                 )
                 st.altair_chart(chart, use_container_width=True)
                 st.dataframe(prob_df, use_container_width=True)
-
-            # remember latest weights
-            st.session_state["sv_w_rf"], st.session_state["sv_w_gb"], st.session_state["sv_w_ab"], st.session_state["sv_w_et"] = sv_w_rf, sv_w_gb, sv_w_ab, sv_w_et
+            else:
+                st.info("Soft voter does not expose probabilities (unexpected).")
