@@ -122,13 +122,23 @@ def make_pipeline(num_cols: List[str], cat_cols: List[str], model_name: str, par
             max_depth=params.get("max_depth", None),
             random_state=42
         )
+    elif model_name == "Soft Voting (RF+GB+Ada+ET)":
+        # Soft voting ensemble with the same base learners as single-case page
+        rf = RandomForestClassifier(n_estimators=300, random_state=42)
+        gb = GradientBoostingClassifier(n_estimators=300, learning_rate=0.05, max_depth=3, random_state=42)
+        ab = AdaBoostClassifier(n_estimators=200, learning_rate=0.5, random_state=42)
+        et = ExtraTreesClassifier(n_estimators=400, random_state=42)
+        clf = VotingClassifier(
+            estimators=[("rf", rf), ("gb", gb), ("ab", ab), ("et", et)],
+            voting="soft"
+        )
     else:
         raise ValueError("Unknown model")
 
     return Pipeline(steps=[("pre", pre), ("clf", clf)])
 
 def make_soft_voter(num_cols: List[str], cat_cols: List[str]) -> Pipeline:
-    """Soft Voting pipeline used ONLY on the Single-Case Prediction page."""
+    """Soft Voting pipeline used for Single-Case Prediction (still available there)."""
     pre = _preprocessor(num_cols, cat_cols)
     rf = RandomForestClassifier(n_estimators=300, random_state=42)
     gb = GradientBoostingClassifier(n_estimators=300, learning_rate=0.05, max_depth=3, random_state=42)
@@ -142,7 +152,14 @@ def make_soft_voter(num_cols: List[str], cat_cols: List[str]) -> Pipeline:
 
 def safe_roc_auc(model, X_val, y_val):
     try:
-        if not hasattr(model, "predict_proba"):
+        # Try to reach predict_proba on the final estimator in the pipeline
+        last = model
+        if hasattr(model, "named_steps") and "clf" in model.named_steps:
+            last = model.named_steps["clf"]
+        if hasattr(model, "named_steps") and "voter" in model.named_steps:
+            last = model.named_steps["voter"]
+
+        if not hasattr(last, "predict_proba"):
             return np.nan
         proba = model.predict_proba(X_val)
         if proba.ndim == 2 and proba.shape[1] == 2:
@@ -286,10 +303,10 @@ elif page == "Train & Evaluate":
         with c1:
             model_name = st.selectbox(
                 "Model",
-                ["Random Forest", "Gradient Boosting", "AdaBoost", "Extra Trees"]
+                ["Random Forest", "Gradient Boosting", "AdaBoost", "Extra Trees", "Soft Voting (RF+GB+Ada+ET)"]
             )
             test_size = st.slider("Test size", 0.1, 0.4, 0.2, 0.01)
-            train_all = st.checkbox("Train all models (compare)")
+            train_all = st.checkbox("Train all models (compare, includes Soft Voting)")
         with c2:
             random_state = st.number_input("Random state", min_value=0, value=42, step=1)
         with c3:
@@ -310,6 +327,9 @@ elif page == "Train & Evaluate":
                 params["n_estimators"] = st.number_input("n_estimators", min_value=50, value=400, step=50)
                 max_depth = st.text_input("max_depth (blank = None)", value="")
                 params["max_depth"] = None if max_depth.strip() == "" else int(max_depth)
+            elif model_name == "Soft Voting (RF+GB+Ada+ET)":
+                st.caption("Soft Voting has fixed reasonable defaults for base learners.")
+                # (You can extend to include weights etc., but keeping simple as requested.)
 
         submitted = st.form_submit_button("Train")
 
@@ -355,20 +375,21 @@ elif page == "Train & Evaluate":
             except Exception as e:
                 st.info(f"Could not render ROC curves: {e}")
 
-        # Save for single-case page (we’ll build soft-voter later from this)
+        # Save for single-case page (we’ll still build soft-voter there if needed)
         st.session_state["trained_model"] = model
         st.session_state["feature_columns"] = list(X.columns)
         st.session_state["train_df"] = pd.concat([X, y.rename(label_col)], axis=1)
         st.session_state["label_col"] = label_col  # remember the target
 
     if submitted and train_all:
-        # ---------------- Train ALL 4 models and compare ----------------
+        # ---------------- Train ALL models and compare (including Soft Voting) ----------------
         with st.spinner("Training all models..."):
             all_cfgs = [
                 ("Random Forest", {"n_estimators": 300, "max_depth": None}),
                 ("Gradient Boosting", {"n_estimators": 300, "learning_rate": 0.05, "max_depth": 3}),
                 ("AdaBoost", {"n_estimators": 200, "learning_rate": 0.5}),
                 ("Extra Trees", {"n_estimators": 400, "max_depth": None}),
+                ("Soft Voting (RF+GB+Ada+ET)", {}),  # uses defaults in make_pipeline
             ]
 
             results = []
@@ -404,7 +425,7 @@ elif page == "Train & Evaluate":
 
                 st.markdown("#### Confusion Matrix")
                 fig, ax = plt.subplots()
-                ax.imshow(r["CM"], cmap="Blues")
+                ax.imshow(r["CM"], cmap="Blues"])
                 ax.set_xticks(range(len(r["Labels"]))); ax.set_yticks(range(len(r["Labels"])))
                 ax.set_xticklabels(r["Labels"], rotation=45, ha="right"); ax.set_yticklabels(r["Labels"])
                 for i in range(r["CM"].shape[0]):
@@ -431,7 +452,7 @@ elif page == "Train & Evaluate":
                     except Exception as e:
                         st.info(f"Could not render ROC curves: {e}")
 
-        # Keep best by accuracy for convenience (single-case will still use soft voter)
+        # Keep best by accuracy for convenience (single-case can still use soft voter)
         best_row = max(results, key=lambda r: r["Accuracy"])
         st.session_state["trained_model"] = best_row["Estimator"]
         st.session_state["feature_columns"] = list(X.columns)
